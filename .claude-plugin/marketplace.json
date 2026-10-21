@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "worktree-task",
+  "description": "Run each Claude Code task in its own git worktree and branch, reviewed and merged after your OK.",
+  "owner": {
+    "name": "The worktree-task authors"
+  },
+  "plugins": [
+    {
+      "name": "worktree-task",
+      "description": "One task per worktree folder and branch: tests first when they help, a fresh-context Claude review, an optional Codex review through codex-review-loop, then one commit and a fast-forward merge into the base branch after your OK, with a report in your terminal.",
+      "source": "./plugins/worktree-task",
+      "category": "development"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "worktree-task",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Runs one task in its own git worktree folder and branch: tests first when they help, a fresh-context Claude review, a Codex review when codex-review-loop is installed, then one commit and a fast-forward merge into your base branch after your OK, with a report in your terminal.",
+  "author": {
+    "name": "The worktree-task authors"
+  },
+  "keywords": ["worktree", "parallel", "task", "code-review", "tdd"]
+}
