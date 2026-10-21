@@ -45,7 +45,8 @@ With neither a task text nor `--from`, ask the user what to do and stop until th
 The git steps run through the script `${CLAUDE_SKILL_DIR}/worktree.sh`, always as
 `bash "${CLAUDE_SKILL_DIR}/worktree.sh" <command> ...`. It prints `KEY=value` lines on
 stdout and its reasons on stderr. Exit codes: 0 done; 2 usage error; 3 refused, nothing
-changed; 4 conflict, rolled back; 5 git error, state needs a look. On any non-zero
+changed; 4 conflict, rolled back; 5 git error or other unexpected failure, state needs a
+look. On any non-zero
 exit, quote its stderr to the user.
 
 A fingerprint counts only when `worktree.sh fingerprint` exits 0 and prints exactly six
@@ -85,6 +86,15 @@ Nothing is created in this step.
    - `auto` and Codex unavailable: Claude review only. Say why.
 6. `SLUG` is `--name`, or a short name derived from the task, such as
    `f13-live-list-counts` or `csv-export`.
+   With Codex, check whether another repository's task already uses this name. That
+   happens when the other repository has the same folder name, because codex-loop keys
+   its task file by folder name.
+   - Read `$HOME/.claude/codex-reviews/<REPO>-<SLUG>/task.md` if it exists.
+   - If its `Task folder:` line names a folder other than `<REPO>-<SLUG>` beside
+     `REPO_ROOT`, and that folder still exists, the other task is still running.
+     Suggest `--name` and stop.
+   - A task file whose folder no longer exists is left over from an earlier task, and
+     step 4 overwrites it.
 7. If `AGENTS.md` forbids committing to or merging into `BASE`, for example "never
    commit to main", tell the user. Continue only if the user names another base.
 
@@ -104,7 +114,14 @@ Nothing is created in this step.
      `--base` is older than the main folder's `.gitignore`, or a `.gitignore` change
      is uncommitted. Tell the user.
    - A non-zero exit stops the task.
-3. Create the run folder `RUN_DIR="$HOME/.claude/worktree-tasks/<RUN_NAME>"`.
+3. Create the run folder `RUN_DIR="$HOME/.claude/worktree-tasks/<RUN_NAME>/<RUN_ID>"`,
+   where `RUN_ID` is the output of `date +%Y%m%d-%H%M%S`. Each invocation gets its own
+   folder, so an earlier task with the same name keeps its logs.
+   - Create the parent folder with `mkdir -p`, and `RUN_DIR` itself with plain `mkdir`.
+     Plain `mkdir` fails when the folder already exists, for example when a repository
+     with the same folder name started a task of this name in the same second.
+   - If it fails that way, append `-2`, `-3`, and so on to `RUN_ID` until `mkdir`
+     succeeds.
    `TASK_FILE` depends on the Codex stage:
    - With Codex: `$HOME/.claude/codex-reviews/<RUN_NAME>/task.md`. codex-loop reads its
      task file from `~/.claude/codex-reviews/<folder name>/task.md`, and the task
@@ -146,6 +163,8 @@ Nothing is created in this step.
 ## 4. Write the task file
 
 Write `TASK_FILE` from `${CLAUDE_SKILL_DIR}/task-template.md`:
+- the `Task folder:` line with `WORKTREE`, which step 2 reads to tell apart the tasks of
+  repositories with the same folder name;
 - the request verbatim (with `--from`, the quoted section and the file's path);
 - numbered acceptance criteria, one testable behavior each;
 - out of scope;
@@ -200,7 +219,9 @@ continue. The user's OK comes at the checkpoint, before the commit.
 
 **Locked-test comparison.** Run `worktree.sh hash` on the locked files and compare the
 output with `locked-tests.txt`. The result is the list of locked tests that changed.
-Run this comparison again before every review round of either stage. Fixes made during
+A locked test that no longer exists prints `HASH=missing <file>`. It counts as a changed
+locked test, under the same rules: a decision recorded first, and never to get a green
+run. Run this comparison again before every review round of either stage. Fixes made during
 a review can change a locked test too.
 
 ## 7. Review stage 1: Claude (always)
@@ -247,7 +268,8 @@ For round `N` from 1 to `--rounds`:
    Otherwise start the next round.
 
 The stage is clean only if its last round reported no P0-P2 findings, rejected ones
-included. If it ended open, do not start Codex: go to the merge gate, which fails.
+included, or the user accepted the rejected ones (step 9). If it ended open, do not
+start Codex: go to the merge gate, which fails.
 
 ## 8. Review stage 2: Codex (when enabled)
 
@@ -266,10 +288,17 @@ included. If it ended open, do not start Codex: go to the merge gate, which fail
    - When tests first was off: no locked-test part.
 3. Follow codex-loop completely. It shows each Codex review verbatim, triages, fixes,
    and writes its final report. Its rule "the loop never commits" holds: the commit is
-   step 11 of this skill, after the loop has ended.
-4. Find the last round's Codex file: the newest
-   `$HOME/.claude/codex-reviews/<RUN_NAME>/*-round*-codex.md`. Count its `[P0]`, `[P1]`,
-   and `[P2]` findings. The stage is clean when there are none.
+   step 11 of this skill, after the loop has ended. Keep `CODEX_RUN`, the `<RUN>`
+   timestamp in the log path that codex-loop prints when it prepares its log folder.
+4. Decide the stage from this run only. The folder
+   `$HOME/.claude/codex-reviews/<RUN_NAME>/` also holds earlier runs, for example those
+   of an earlier task with the same name: never count findings in their files.
+   - If codex-loop stopped on an error (Codex failed, a usage limit, a changed
+     fingerprint), or no `<CODEX_RUN>-round<N>-codex.md` file exists, the stage failed.
+     It is not clean.
+   - Otherwise take the `<CODEX_RUN>-round<N>-codex.md` file with the highest `N` and
+     count its `[P0]`, `[P1]`, and `[P2]` findings. The stage is clean when there are
+     none, or when the user accepted the rejected ones (step 9).
 5. Run the locked-test comparison again. If a locked test changed during the Codex
    stage, the Claude reviewer has not seen that change. Run one more Claude round
    (step 7), which must be clean, before the merge gate.
@@ -281,12 +310,28 @@ The gate passes only when all of these hold:
 - the documented checks pass on the final tree (rerun them if anything changed since
   the last run);
 - the Claude stage is clean;
-- the Codex stage is clean, or Codex did not run, with the reason recorded;
+- the Codex stage is clean, or Codex is skipped for a recorded reason, which is one of:
+  - step 2 decided not to run it (`--codex off`, or unavailable under `auto`);
+  - after it failed, the user explicitly said to skip it (step 14), with their words in
+    the task file's Decisions.
+
+  A Codex stage that failed is never clean;
 - every locked test that changed has its decision recorded;
 - no stop condition was hit.
 
 If the gate fails, stop (step 14). If it passes, run `worktree.sh fingerprint` and keep
 the output as `REVIEWED_FP`: the exact tree the reviews and checks approved.
+
+**Rejected findings.** A stage can end open only because its last round's P0-P2
+findings were all rejected with evidence, none of them fixed. The gate then fails like
+any other open stage. At the stop, list each of those findings with the evidence for
+its rejection. The stage counts as clean only when the user replies with an explicit
+acceptance, such as "accept":
+- Record the reply verbatim in the task file's Decisions, with the findings it covers.
+- Only the user's reply counts. `--auto` never accepts a rejection, and you never accept
+  one yourself.
+- Then continue with the next step that has not run: the Codex stage if it is enabled
+  and has not run yet, otherwise this gate.
 
 ## 10. Checkpoint (skipped with `--auto`)
 
@@ -326,15 +371,21 @@ If the user asks for changes:
 
 ## 12. Rebase, merge, clean up
 
-1. In the task folder, run `worktree.sh rebase <BASE>`.
+1. In the task folder, note `ONTO`, the output of
+   `git merge-base HEAD refs/heads/<BASE>`. Then run `worktree.sh rebase <BASE>`.
    - Exit 4: a conflict. The rebase was aborted and the commit is intact. Stop (step 14)
      and name the files from the `CONFLICT` lines.
    - Exit 5: the rebase failed for another reason, and git's message says why. Stop
      (step 14) and quote that message. Do not call it a conflict.
    - Any other non-zero exit, such as 3 for uncommitted changes in the task folder,
      also stops the task (step 14). Never merge after a failed rebase.
-   - `BASE_MOVED=yes`: other work reached `BASE`, so rerun the checks. A failing check
-     stops the task (step 14).
+   - `BASE_MOVED=yes`: other work reached `BASE`.
+     - Before the rebase you noted `ONTO`, the output of
+       `git merge-base HEAD refs/heads/<BASE>`.
+     - If `git diff --name-only <ONTO> <BASE_SHA printed by the rebase>` lists a
+       lockfile or a dependency manifest, such as `package.json` or a lockfile from
+       step 3.6, rerun the install command of step 3.6.
+     - Then rerun the checks. A failing check stops the task (step 14).
    - `OVERLAP` lines name files changed on both sides. Run the review stages again on
      the branch against `BASE`, following steps 7 and 8 (for codex-loop, pass
      `--base refs/heads/<BASE>`), then the merge gate.
@@ -353,6 +404,8 @@ If the user asks for changes:
    - Exit 3 "not a fast-forward" means another task merged meanwhile. Enter the task
      folder again with `EnterWorktree` (`path`: `WORKTREE`) and repeat this step from
      1. If it happens a second time, stop.
+   - Exit 3 whose git message names `index.lock` means another git command was running
+     in the main folder. Run this step once more; if it happens again, stop.
    - Any other exit 3 means the main folder is on another branch, or the merge would
      overwrite the user's uncommitted work. Stop, and tell the user exactly what to do
      and to reply "continue" afterwards.
@@ -361,10 +414,22 @@ If the user asks for changes:
    - Go on to cleanup only after exit 0 with a `MERGED_SHA` line.
 4. Run `worktree.sh remove <WORKTREE> <BRANCH> <BASE>`.
    - It unlinks symbolic links and junctions first: on Windows, deleting a folder
-     through git follows junctions and would delete the files they point to.
+     through git follows junctions and would delete the files they point to. Tracked
+     symbolic links stay, because git made them and deletes them without following
+     them.
    - If it fails, the folder is kept. Report why (often an editor or a dev server
      holding files open) and give the command to retry after closing them.
    - Never remove the folder any other way, and never use `--force`.
+   - If the user wants to remove a folder that `remove` refused, give them these
+     commands. Run them from the main folder in bash (Git Bash on Windows), and only
+     after the user has decided to discard what is left in the folder. The first line
+     unlinks every link, because `git worktree remove --force` would follow a junction.
+     The `&&` stops at the first step that fails:
+     ```bash
+     find "<WORKTREE>" -type l -exec rm -f -- {} + &&
+       git worktree remove --force "<WORKTREE>" &&
+       git branch -D "<BRANCH>"   # only to discard the task's commits too
+     ```
 5. Never push.
 
 ## 13. Report
@@ -384,10 +449,32 @@ At any step that stops:
 2. Keep the folder and the branch. Do not commit and do not clean up.
 3. Stay in the task folder, unless the stop happened after step 12.2.
 4. Tell the user how to continue: describe the change or decision in this session and
-   reply "continue". The task resumes at the step that stopped.
+   reply "continue". The task resumes at the step that stopped. When the merge gate
+   stopped it, say which of these applies:
+   - Every open finding was rejected with evidence: reply "accept" to accept the
+     rejections (step 9), or describe a change.
+   - A review stage ended with findings that were fixed but not reviewed again, for
+     example at the round limit: "continue" runs one more round of that stage. Then it
+     continues with the next step that has not run: the Codex stage if it is enabled
+     and has not run yet, otherwise the gate.
+   - The Codex stage failed: "continue" runs it again. Codex is skipped only when the
+     user explicitly says so. Record their words as a decision; the gate then counts
+     Codex as skipped (step 9), not as clean.
 
 After the terminal is closed, `claude --resume` reopens this session.
 `$RUN_DIR/state.md` records where the task stood.
+
+**Resuming.** Whenever the task resumes, after `claude --resume` or a reply to a stop,
+check where the session is before any edit, check, or review:
+- `git rev-parse --show-toplevel` must print `WORKTREE` from the end of step 3.5 until
+  step 12.2, and `REPO_ROOT` otherwise.
+  - Before step 3.5 the session has not moved: steps 2 to 3.4 run in the main folder,
+    and the task folder may not exist yet.
+  - A stop at step 3.5 resumes in the main folder, with that step's move.
+- If it prints something else, move first and confirm again: `EnterWorktree` with
+  `path` set to `WORKTREE`, or `ExitWorktree` with `action: "keep"`.
+- Take the values from `$RUN_DIR/state.md` when the conversation no longer shows them.
+  That file exists from step 3.4 on; before that, the values are in the conversation.
 
 ## Guardrails
 

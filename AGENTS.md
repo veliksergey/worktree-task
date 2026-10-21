@@ -66,9 +66,15 @@ also in `marketplace.json`. Add an entry for the new version at the top of
     merged;
   - the main folder is edited only by that merge;
   - reviewers are read-only and fingerprinted;
-  - `remove` unlinks links before deleting. It refuses unmerged branches, dirty folders,
-    the main folder, branches with an upstream, and populated submodules, and it stops
-    if the link scan fails;
+  - `remove` unlinks every untracked link before deleting. Tracked symbolic links stay,
+    because git deletes them without following them. It refuses unmerged branches,
+    dirty folders, the main folder, branches with an upstream, populated submodules,
+    links that stand where git tracks files, tracked links marked assume-unchanged or
+    skip-worktree, and tracked links spelled differently on disk. It stops if the link
+    scan or the unlinking fails;
+  - a review finding that was rejected passes the merge gate only with the user's
+    explicit acceptance, never under `--auto`. A Codex stage that failed is never
+    clean; the gate skips it only on the user's explicit, recorded word;
   - `copy-local` never writes through a link, and never copies a file the task folder
     would not ignore. `commit` refuses while a copied local file is unignored or
     tracked;

@@ -167,7 +167,7 @@ commit step also refuses if a copied file has stopped being ignored.
 |---|---|
 | Task folder | `../<repo>-<slug>`, removed after the merge |
 | Task branch | `task/<slug>`, deleted after the merge |
-| Report, state, review rounds | `~/.claude/worktree-tasks/<repo>-<slug>/` |
+| Report, state, review rounds | `~/.claude/worktree-tasks/<repo>-<slug>/<run>/`, one folder per run, named by its start time |
 | Task file | `~/.claude/codex-reviews/<repo>-<slug>/task.md` with Codex, where codex-loop reads it; otherwise in the folder above |
 
 ## When a task stops
@@ -175,14 +175,39 @@ commit step also refuses if a copied file has stopped being ignored.
 A task stops instead of committing when:
 - a check fails;
 - a review stage ends with an open P0-P2 finding;
+- the Codex review fails, for example at a usage limit;
 - a reviewer changed files;
 - the rebase conflicts;
 - the merge is refused.
 
 The folder and branch are kept. The report says why the task stopped. Describe the
 change or decision in the same session and reply **continue**. If the terminal was
-closed, `claude --resume` reopens the session, and
-`~/.claude/worktree-tasks/<repo>-<slug>/state.md` records where the task stood.
+closed, `claude --resume` reopens the session, and `state.md` in the newest
+`~/.claude/worktree-tasks/<repo>-<slug>/<run>/` folder records where the task stood.
+
+When the merge gate stopped the task, the report says which reply fits:
+- **accept**: Claude rejected every open finding with evidence, and you agree. Your
+  reply is recorded in the task file. Nothing accepts a rejection for you, not even
+  `--auto`.
+- **continue**: runs one more review round when the last round's fixes have not been
+  reviewed yet, or runs the Codex review again after it failed. To skip Codex instead,
+  say so.
+
+### Removing a task folder by hand
+
+To abandon a task, or when the cleanup refused to remove a folder, remove it yourself.
+Run these commands from the main folder, in bash (Git Bash on Windows). Unlink every link
+first: on Windows, `git worktree remove --force` follows junctions, such as those in a
+pnpm `node_modules`, and deletes the files they point to. The `&&` stops at the first
+step that fails, so nothing is removed while a link remains.
+
+```bash
+find "../<repo>-<slug>" -type l -exec rm -f -- {} + &&
+  git worktree remove --force "../<repo>-<slug>" &&
+  git branch -D "task/<slug>"   # only to discard the task's commits too
+```
+
+`--force` discards the folder's uncommitted work, and `-D` discards the branch's commits.
 
 ## Safety
 
@@ -204,7 +229,10 @@ closed, `claude --resume` reopens the session, and
 - **Safe cleanup on Windows.** `git worktree remove` follows junctions on Windows, the
   links package managers such as pnpm create in `node_modules`, and deletes the files
   they point to. The cleanup unlinks every link first, and the test suite checks that a
-  file outside the folder survives.
+  file outside the folder survives. Tracked symbolic links, such as `CLAUDE.md` linked
+  to `AGENTS.md`, stay: git made them and deletes them without following them.
+- **Rejected findings need you.** A finding Claude rejected with evidence still blocks
+  the merge until you reply **accept**.
 - **Only you can start it.** The skill sets `disable-model-invocation`, so Claude never
   starts it on its own.
 

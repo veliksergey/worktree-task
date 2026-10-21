@@ -37,6 +37,8 @@ Locked tests changed after locking: <none, or each file with its Decisions entry
 
 Rejected findings and their evidence: <none, or one line each>
 
+Rejections you accepted: <none, or each finding with your reply, quoted>
+
 ## Waiting for your decision (P3)
 <none, or one line each>
 

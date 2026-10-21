@@ -2,7 +2,8 @@
 # Git steps for the worktree-task skill. Each command prints KEY=value lines on stdout
 # and explanations on stderr.
 # Exit codes: 0 done, 2 usage error, 3 refused (nothing changed),
-# 4 conflict (rolled back, nothing changed), 5 git error (state may need a look).
+# 4 conflict (rolled back, nothing changed), 5 git error or other unexpected failure
+# (state may need a look).
 set -euo pipefail
 
 usage() {
@@ -19,6 +20,7 @@ usage: worktree.sh preflight
 commit, rebase, fingerprint and hash run inside the task folder; the others in the
 main folder.
 EOF
+  intended=yes
   exit 2
 }
 
@@ -26,6 +28,7 @@ die() {
   local code="$1"
   shift
   printf 'worktree.sh: %s\n' "$*" >&2
+  intended=yes
   exit "$code"
 }
 
@@ -33,9 +36,20 @@ die() {
 # when it only checks whether a revision range is a file name. Other platforms ignore it.
 git() { command git -c core.longpaths=true "$@"; }
 
-# One temporary file per run, removed on exit.
-scratch=""
-trap '[ -z "$scratch" ] || rm -f -- "$scratch"' EXIT
+# One temporary file per run, removed on exit. A failure that set -e stops on exits
+# with that command's own code, which could read as 2, 3, or 4, so every exit that did
+# not come through die or usage is reported as 5, the code for "take a look".
+scratch="" intended=""
+on_exit() {
+  local rc=$?
+  [ -z "$scratch" ] || rm -f -- "$scratch" || true
+  if [ "$rc" -ne 0 ] && [ "$intended" != yes ]; then
+    printf 'worktree.sh: unexpected failure (exit %s); state may need a look\n' "$rc" >&2
+    rc=5
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
 new_scratch() { scratch="$(mktemp)" || die 5 "cannot create a temporary file; nothing changed"; }
 
 git_dir() { git -C "$1" rev-parse --path-format=absolute --git-dir; }
@@ -123,7 +137,7 @@ cmd_copy_local() {
   [ $# -eq 1 ] || usage
   require_main
   require_task_folder "$1"
-  local rel parent count=0 copied_list
+  local rel parent count=0 copied_list tracked
   # Remembered per task folder, so that commit can refuse if a copied file stops being ignored.
   copied_list="$(git -C "$task_top" rev-parse --path-format=absolute --git-path worktree-task-copied)" \
     || die 5 "cannot locate the task folder's git directory; nothing copied"
@@ -138,7 +152,12 @@ cmd_copy_local() {
     done > "$scratch"
   fi
   while IFS= read -r -d '' rel; do
-    git -C "$top" check-ignore -q -- "$rel" || continue
+    # Read as a pattern, a name such as .env[x] would match a tracked .envx. With
+    # --no-index, check-ignore takes the name as it is; ls-files says if git tracks it.
+    git -C "$top" check-ignore -q --no-index -- "$rel" || continue
+    tracked="$(git --literal-pathspecs -C "$top" ls-files -- "$rel")" \
+      || die 5 "git ls-files failed for $rel; copying stopped"
+    [ -z "$tracked" ] || continue
     { [ -f "$top/$rel" ] && [ ! -L "$top/$rel" ]; } || continue
     if [ -e "$task_top/$rel" ] || [ -L "$task_top/$rel" ]; then
       printf 'SKIPPED=%s\n' "$rel"
@@ -225,22 +244,25 @@ cmd_rebase() {
 
 cmd_merge() {
   [ $# -eq 2 ] || usage
-  local branch="$1" base="$2" current before target
+  local branch="$1" base="$2" current before target now anc=0
   require_main
   has_branch "$branch" || die 3 "branch not found: $branch"
   current="$(branch_of "$top")"
   [ "$current" = "$base" ] || die 3 "the main folder is on '$current', not '$base'; switch it to $base and retry"
   target="$(tip "$branch")" || die 5 "cannot resolve branch $branch"
-  if ! git -C "$top" merge-base --is-ancestor "$(tip "$base")" "$target"; then
+  # One reading of the base for the check and for judging a failed merge below.
+  before="$(git -C "$top" rev-parse HEAD)"
+  if ! git -C "$top" merge-base --is-ancestor "$before" "$target"; then
     die 3 "$branch is not a fast-forward of $base; rebase it first"
   fi
-  before="$(git -C "$top" rev-parse HEAD)"
   # By default git overwrites ignored files, stashes the user's uncommitted work under
   # merge.autoStash, and squashes under branch.<base>.mergeOptions; these flags prevent all three.
   if ! git -C "$top" merge --ff-only --no-overwrite-ignore --no-autostash --no-squash --quiet "$target" >&2; then
-    if [ "$(git -C "$top" rev-parse HEAD)" = "$before" ]; then
-      die 3 "git refused the merge (see above); nothing changed"
-    fi
+    now="$(git -C "$top" rev-parse HEAD)" || die 5 "the merge failed and HEAD cannot be read; inspect the main folder"
+    # Another task can merge between the check above and this merge.
+    git -C "$top" merge-base --is-ancestor "$now" "$target" || anc=$?
+    [ "$anc" -ne 1 ] || die 3 "$branch is not a fast-forward of $base, which another merge moved meanwhile; rebase it first"
+    [ "$now" != "$before" ] || die 3 "git refused the merge (see above); nothing changed"
     die 5 "the merge failed after moving $base; inspect the main folder"
   fi
   [ "$(git -C "$top" rev-parse HEAD)" = "$target" ] \
@@ -250,7 +272,10 @@ cmd_merge() {
 
 cmd_remove() {
   [ $# -eq 3 ] || usage
-  local branch="$2" base="$3" link links=() tracked submodules
+  local branch="$2" base="$3" link links=() kept=() submodules entry tag mode path dir dir_link p
+  local last_dir=// keep=// found=// tab=$'\t' count=0
+  # git worktree remove --force and other git commands follow junctions on Windows.
+  local by_hand="to remove it by hand, first unlink every link in it (README: Removing a task folder by hand)"
   require_main
   require_task_folder "$1"
   # git branch -d checks the merge against the main folder's HEAD, so HEAD must be the base.
@@ -270,7 +295,7 @@ cmd_remove() {
   submodules="$(git -C "$task_top" submodule status --recursive)" \
     || die 5 "git submodule status failed in $task_top; nothing removed"
   if printf '%s\n' "$submodules" | grep -q '^[^-]'; then
-    die 3 "$task_top has populated submodules; nothing removed, remove it by hand"
+    die 3 "$task_top has populated submodules; nothing removed; $by_hand"
   fi
   # Git for Windows follows junctions when it deletes a folder, which would delete the
   # files they point to, so every link is removed first without being followed. The scan
@@ -279,22 +304,61 @@ cmd_remove() {
   if ! (cd "$task_top" && find . -type l -print0) > "$scratch"; then
     die 5 "could not list the links in $task_top; nothing removed"
   fi
-  while IFS= read -r -d '' link; do
-    # A failed lookup must not count as "untracked".
-    tracked="$(git -C "$task_top" ls-files -- "${link#./}")" \
-      || die 5 "git ls-files failed in $task_top; nothing removed"
-    if [ -n "$tracked" ]; then
-      die 3 "tracked link ${link#./} in $task_top; remove the folder by hand"
-    fi
-    links+=("$link")
-  done < "$scratch"
+  while IFS= read -r -d '' link; do links+=("${link#./}"); done < "$scratch"
+  if [ "${#links[@]}" -gt 0 ]; then
+    # One index listing for all links: a lookup per link took minutes with the thousands
+    # of links package managers create. A failed listing must not count as "untracked".
+    # -v tags each entry: "H" is plain, while assume-unchanged (lower case) and
+    # skip-worktree ("S") hide the file from git status.
+    git -C "$task_top" ls-files -s -v -z > "$scratch" || die 5 "git ls-files failed in $task_top; nothing removed"
+    while IFS= read -r -d '' entry; do
+      tag="${entry%% *}" mode="${entry#* }" path="${entry#*"$tab"}"
+      mode="${mode%% *}"
+      case "$path" in */*) dir="${path%/*}" ;; *) dir="" ;; esac
+      # The outermost link among the entry's folders, found once per folder.
+      if [ "$dir" != "$last_dir" ]; then
+        last_dir="$dir" p="$dir" dir_link=""
+        while [ -n "$p" ]; do
+          if [ -L "$task_top/$p" ]; then dir_link="$p"; fi
+          case "$p" in */*) p="${p%/*}" ;; *) p="" ;; esac
+        done
+      fi
+      [ -z "$dir_link" ] || die 3 "tracked files behind the link $dir_link in $task_top; nothing removed; $by_hand"
+      if [ -L "$task_top/$path" ]; then
+        # A symbolic link git checked out: git deletes it without following it, and
+        # unlinking it would leave the folder dirty.
+        [ "$mode" = 120000 ] || die 3 "the tracked file $path in $task_top is a link; nothing removed; $by_hand"
+        # Only then has the clean check above seen it: a junction swapped in under such
+        # a mark would be kept and followed.
+        [ "$tag" = H ] || die 3 "the tracked link $path in $task_top is marked assume-unchanged or skip-worktree, so git status cannot vouch for it; nothing removed"
+        keep="$keep$path//"
+        kept+=("$path")
+      fi
+    done < "$scratch"
+  fi
+  # Every other link, for batched rm calls. No path contains "//", so a kept name cannot
+  # match part of another.
   for link in ${links[@]+"${links[@]}"}; do
-    (cd "$task_top" && rm -f -- "$link")
+    case "$keep" in *"//$link//"*) found="$found$link//"; continue ;; esac
+    printf './%s\0' "$link"
+    count=$((count + 1))
+  done > "$scratch"
+  # find names each link as it is spelled on disk. A kept link it did not name differs
+  # in case or Unicode form there, and would be unlinked under that other spelling.
+  for path in ${kept[@]+"${kept[@]}"}; do
+    case "$found" in
+      *"//$path//"*) ;;
+      *) die 3 "the tracked link $path in $task_top is spelled differently on disk; rename it back to $path, then retry; nothing removed" ;;
+    esac
   done
+  if [ "$count" -gt 0 ]; then
+    (cd "$task_top" && xargs -0 rm -f --) < "$scratch" \
+      || die 5 "could not unlink every link in $task_top; nothing removed"
+  fi
   git -C "$top" worktree remove "$task_top" >&2 \
-    || die 5 "git worktree remove failed after unlinking ${#links[@]} link(s); the folder is still at $task_top"
+    || die 5 "git worktree remove failed after unlinking $count link(s); the folder is still at $task_top"
   git -C "$top" branch -d "$branch" >&2 || die 5 "the folder was removed but deleting $branch failed"
-  printf 'REMOVED=%s\nUNLINKED=%s\nDELETED_BRANCH=%s\n' "$task_top" "${#links[@]}" "$branch"
+  printf 'REMOVED=%s\nUNLINKED=%s\nDELETED_BRANCH=%s\n' "$task_top" "$count" "$branch"
 }
 
 # Untracked-file helpers for cmd_fingerprint, the same as codex-review-loop's
@@ -438,7 +502,8 @@ cmd_commit() {
   if [ -f "$copied_list" ]; then
     while IFS= read -r -d '' rel; do
       { [ -e "$here/$rel" ] || [ -L "$here/$rel" ]; } || continue
-      tracked="$(git -C "$here" ls-files -- "$rel")" || die 5 "git ls-files failed; nothing committed"
+      # Literal: as a pattern, a name such as .env[x] would match a tracked .envx.
+      tracked="$(git --literal-pathspecs -C "$here" ls-files -- "$rel")" || die 5 "git ls-files failed; nothing committed"
       if [ -n "$tracked" ] || ! git -C "$here" check-ignore -q --no-index -- "$rel"; then
         die 3 "the copied local file $rel is no longer ignored, or is tracked; nothing committed"
       fi
@@ -458,14 +523,25 @@ cmd_commit() {
     "$(git -C "$here" rev-parse HEAD)" "$staged" "$committed" "$changed"
 }
 
+# A file that does not exist prints HASH=missing: a deleted locked test is a change to
+# report, not a failure to read. A file that exists but cannot be hashed still fails.
 cmd_hash() {
   [ $# -ge 1 ] || usage
-  local hashes file i=0
-  hashes="$(git hash-object -- "$@")" || die 5 "git hash-object failed"
-  while IFS= read -r file; do
-    i=$((i + 1))
-    printf 'HASH=%s %s\n' "$(printf '%s\n' "$hashes" | sed -n "${i}p")" "$file"
-  done < <(printf '%s\n' "$@")
+  local hashes="" file present=() i=0
+  for file in "$@"; do
+    if [ -e "$file" ]; then present+=("$file"); fi
+  done
+  if [ "${#present[@]}" -gt 0 ]; then
+    hashes="$(git hash-object -- "${present[@]}")" || die 5 "git hash-object failed"
+  fi
+  for file in "$@"; do
+    if [ -e "$file" ]; then
+      i=$((i + 1))
+      printf 'HASH=%s %s\n' "$(printf '%s\n' "$hashes" | sed -n "${i}p")" "$file"
+    else
+      printf 'HASH=missing %s\n' "$file"
+    fi
+  done
 }
 
 [ $# -ge 1 ] || usage

@@ -1,5 +1,7 @@
 # Task: <repository>, <slug>, <yyyy-mm-dd hh:mm>
 
+Task folder: <WORKTREE, the task folder's absolute path>
+
 <!--
 Written by Claude before any code, and kept up to date until the task ends. The
 reviewers judge the change against it, so it says what the user asked for, not what

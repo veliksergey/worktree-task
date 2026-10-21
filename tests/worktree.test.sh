@@ -29,6 +29,8 @@ make_link() {
     *) ln -s "$2" "$1" ;;
   esac
 }
+# make_symlink <target> <link>: a relative symbolic link; on Windows it needs Developer Mode.
+make_symlink() { MSYS=winsymlinks:nativestrict ln -s "$1" "$2" 2>/dev/null && [ -L "$2" ]; }
 
 # Every write below happens inside this folder, so stop before writing if it is missing.
 tmp="$(mktemp -d)" || abort "cannot create a temporary folder"
@@ -77,6 +79,50 @@ mkdir -p "$tmp/bin-nodiff" || abort "stand-in folder"
 printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = --no-renames ] && exit 42; done\nexec "%s" "$@"\n' "$real_git" \
   > "$tmp/bin-nodiff/git" && chmod +x "$tmp/bin-nodiff/git" || abort "diff stand-in"
 printf '#!/bin/sh\nexit 1\n' > "$tmp/bin-nofind/find" && chmod +x "$tmp/bin-nofind/find" || abort "find stand-in"
+# A git and an rm that log each git ls-files call and each rm call given a link under
+# node_modules/ to $tmp/calls.log, and an rm that fails on such links.
+real_rm="$(command -v rm)" || abort "rm not found"
+mkdir -p "$tmp/bin-count" "$tmp/bin-norm" || abort "stand-in folders"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = ls-files ] && echo ls-files >> "%s"; done\nexec "%s" "$@"\n' \
+  "$tmp/calls.log" "$real_git" > "$tmp/bin-count/git" && chmod +x "$tmp/bin-count/git" || abort "counting git"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *node_modules/*) echo rm >> "%s"; break ;; esac; done\nexec "%s" "$@"\n' \
+  "$tmp/calls.log" "$real_rm" > "$tmp/bin-count/rm" && chmod +x "$tmp/bin-count/rm" || abort "counting rm"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *node_modules/*) exit 1 ;; esac; done\nexec "%s" "$@"\n' \
+  "$real_rm" > "$tmp/bin-norm/rm" && chmod +x "$tmp/bin-norm/rm" || abort "failing rm"
+# A git that advances main (to $RACE_TO) just before a merge, the way another task
+# merging at that moment would, and a cp that fails.
+mkdir -p "$tmp/bin-mergerace" "$tmp/bin-nocp" || abort "stand-in folders"
+cat > "$tmp/bin-mergerace/git" <<EOF || abort "merge race stand-in"
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [ "\$a" = merge ]; then "$real_git" update-ref refs/heads/main "\$RACE_TO" || exit 99; break; fi
+done
+exec "$real_git" "\$@"
+EOF
+chmod +x "$tmp/bin-mergerace/git" || abort "chmod merge race stand-in"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/bin-nocp/cp" && chmod +x "$tmp/bin-nocp/cp" || abort "cp stand-in"
+# A git that advances main once, at the first merge-base call (the fast-forward check),
+# and a sort that fails with status 2, the code sort uses for I/O errors.
+mkdir -p "$tmp/bin-baserace" "$tmp/bin-sort2" || abort "stand-in folders"
+cat > "$tmp/bin-baserace/git" <<EOF || abort "base race stand-in"
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [ "\$a" = merge-base ] && [ ! -e "\$RACE_ONCE" ]; then
+    : > "\$RACE_ONCE" && "$real_git" update-ref refs/heads/main "\$RACE_TO" || exit 99
+    break
+  fi
+done
+exec "$real_git" "\$@"
+EOF
+chmod +x "$tmp/bin-baserace/git" || abort "chmod base race stand-in"
+printf '#!/bin/sh\nexit 2\n' > "$tmp/bin-sort2/sort" && chmod +x "$tmp/bin-sort2/sort" || abort "sort stand-in"
+
+# manual_block <file> <marker>: the first ```bash block after the line holding <marker>,
+# unindented: the manual removal commands the README and the skill give the user.
+manual_block() {
+  awk -v m="$2" 'index($0, m) { found = 1 } found && /^[[:space:]]*```bash/ { inb = 1; next }
+    inb && /^[[:space:]]*```/ { exit } inb { sub(/^[[:space:]]+/, ""); print }' "$1"
+}
 
 # new_repo <case>: sets $repo to a fresh repository $tmp/<case>/app with one commit on main.
 new_repo() {
@@ -209,6 +255,13 @@ run_in "$repo" copy-local "$repo"
 check "copy-local: the main folder as target refused" [ "$rc" -eq 3 ]
 run_in "$repo" copy-local "$tmp/nogit"
 check "copy-local: a folder outside git refused" [ "$rc" -eq 3 ]
+
+# An unexpected failure under set -e (here cp) exits 5, not the failing command's code.
+new_repo copyfail
+run_in "$repo" create feat
+run_with "$tmp/bin-nocp" "$repo" copy-local "$tmp/copyfail/app-feat"
+check "copy-local: an unexpected failure exits 5 with a message" \
+  eval '[ "$rc" -eq 5 ] && grep -q "unexpected failure" "$tmp/stderr"'
 
 # A base whose .gitignore does not cover the local file: copying it would expose it.
 new_repo notignored
@@ -411,6 +464,24 @@ check "merge: with branch.main.mergeOptions=--squash, still a real fast-forward"
   eval '[ "$rc" -eq 0 ] && [ "$(sha "$repo" main)" = "$(sha "$repo" task/feat5)" ] && [ -z "$(git -C "$repo" status --porcelain)" ]'
 git -C "$repo" config --unset branch.main.mergeOptions || abort "unset mergeOptions"
 
+# Another task merges between the fast-forward check and the merge.
+run_in "$repo" create feat6
+commit_file "$tmp/merge/app-feat6" feat6.txt feat6 "task 6 work" || abort "task 6 commit"
+before="$(sha "$repo" main)"
+{ git -C "$repo" switch -q -c race-tmp && commit_file "$repo" race6.txt r6 "race commit" &&
+  race_to="$(sha "$repo" race-tmp)" && git -C "$repo" switch -q main && git -C "$repo" branch -q -D race-tmp; } \
+  || abort "merge race commit"
+out="$(cd "$repo" && RACE_TO="$race_to" PATH="$tmp/bin-mergerace:$PATH" bash "$wt_sh" merge task/feat6 main 2>"$tmp/stderr")"; rc=$?
+check "merge: a base another task moved during the merge is reported as not a fast-forward" \
+  eval '[ "$rc" -eq 3 ] && grep -q "not a fast-forward" "$tmp/stderr" && [ "$(sha "$repo" main)" = "$race_to" ]'
+git -C "$repo" update-ref refs/heads/main "$before" || abort "undo merge race move"
+# The same race one step earlier, while the fast-forward check runs.
+rm -f "$tmp/race.once"
+out="$(cd "$repo" && RACE_TO="$race_to" RACE_ONCE="$tmp/race.once" PATH="$tmp/bin-baserace:$PATH" bash "$wt_sh" merge task/feat6 main 2>"$tmp/stderr")"; rc=$?
+check "merge: a base another task moved during the fast-forward check is reported as not a fast-forward" \
+  eval '[ -e "$tmp/race.once" ] && [ "$rc" -eq 3 ] && grep -q "not a fast-forward" "$tmp/stderr" && [ "$(sha "$repo" main)" = "$race_to" ]'
+git -C "$repo" update-ref refs/heads/main "$before" || abort "undo base race move"
+
 # --- remove --------------------------------------------------------------------------
 new_repo remove
 run_in "$repo" create feat
@@ -466,6 +537,133 @@ check "remove: reports both links as unlinked" [ "$(val UNLINKED)" = 2 ]
 check "remove: a file a link pointed to outside the folder survives" \
   eval '[ "$(cat "$tmp/remove/outside/sentinel.txt" 2>/dev/null)" = keep ]'
 
+# Many links: one git ls-files and one rm, not one of each per link, which took minutes
+# with the thousands of links package managers create.
+new_repo manylinks
+run_in "$repo" create feat
+task="$tmp/manylinks/app-feat"
+commit_file "$task" feat.txt feat "task work" || abort "manylinks commit"
+run_in "$repo" merge task/feat main
+[ "$rc" -eq 0 ] || abort "manylinks merge"
+{ mkdir -p "$task/node_modules" "$tmp/manylinks/outside" && echo keep > "$tmp/manylinks/outside/sentinel.txt"; } \
+  || abort "manylinks folders"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do make_link "$task/node_modules/l$i" "$tmp/manylinks/outside" || abort "link $i"; done
+run_with "$tmp/bin-norm" "$repo" remove "$task" task/feat main
+check "remove: a failed unlink exits 5 before the folder is removed, and the link targets survive" \
+  eval '[ "$rc" -eq 5 ] && [ -d "$task" ] && branch_exists "$repo" task/feat && [ "$(cat "$tmp/manylinks/outside/sentinel.txt")" = keep ]'
+: > "$tmp/calls.log" || abort "calls log"
+run_with "$tmp/bin-count" "$repo" remove "$task" task/feat main
+check "remove: twelve links take one git ls-files call and one rm call" \
+  eval '[ "$rc" -eq 0 ] && [ "$(val UNLINKED)" = 12 ] && [ "$(grep -c ls-files "$tmp/calls.log")" -eq 1 ] && [ "$(grep -c rm "$tmp/calls.log")" -eq 1 ] && [ ! -e "$task" ] && [ "$(cat "$tmp/manylinks/outside/sentinel.txt")" = keep ]'
+
+# The manual removal commands in the README and the skill: if unlinking fails, nothing
+# after it may run, or git worktree remove --force would follow the junction.
+readme_steps="$(manual_block "$here/../README.md" "### Removing a task folder by hand")"
+skill_steps="$(manual_block "$here/../plugins/worktree-task/skills/start/SKILL.md" "If the user wants to remove a folder that")"
+{ [ -n "$readme_steps" ] && [ -n "$skill_steps" ]; } || abort "manual removal commands not found"
+for doc in readme skill; do
+  new_repo "manual-$doc"
+  run_in "$repo" create feat
+  task="$tmp/manual-$doc/app-feat"
+  { commit_file "$task" feat.txt feat "abandoned work" && mkdir -p "$task/node_modules" "$tmp/manual-$doc/outside" &&
+    echo keep > "$tmp/manual-$doc/outside/sentinel.txt" &&
+    make_link "$task/node_modules/ext" "$tmp/manual-$doc/outside"; } || abort "manual-$doc setup"
+  if [ "$doc" = readme ]; then
+    steps="${readme_steps//"<repo>"/app}" steps="${steps//"<slug>"/feat}"
+  else
+    steps="${skill_steps//"<WORKTREE>"/$task}" steps="${steps//"<BRANCH>"/task/feat}"
+  fi
+  (cd "$repo" && PATH="$tmp/bin-norm:$PATH" bash -c "$steps") > /dev/null 2>&1
+  check "manual removal ($doc): a failed unlink stops before the folder is removed" \
+    eval '[ -d "$task" ] && [ -L "$task/node_modules/ext" ] && [ "$(cat "$tmp/manual-$doc/outside/sentinel.txt" 2>/dev/null)" = keep ]'
+  (cd "$repo" && bash -c "$steps") > /dev/null 2>&1
+  check "manual removal ($doc): removes the folder and the branch, and the link target survives" \
+    eval '[ ! -e "$task" ] && ! branch_exists "$repo" task/feat && [ "$(cat "$tmp/manual-$doc/outside/sentinel.txt" 2>/dev/null)" = keep ]'
+done
+
+# A link where git tracks a folder: git sees through a junction, so the tree can look
+# clean, but deleting the folder would follow it.
+new_repo linkdir
+run_in "$repo" create feat
+task="$tmp/linkdir/app-feat"
+commit_file "$task" feat.txt feat "task work" || abort "linkdir commit"
+run_in "$repo" merge task/feat main
+[ "$rc" -eq 0 ] || abort "linkdir merge"
+{ mkdir -p "$tmp/linkdir/copy" && echo one > "$tmp/linkdir/copy/a.txt" && rm -rf -- "${task:?}/src" &&
+  make_link "$task/src" "$tmp/linkdir/copy"; } || abort "link over src"
+run_in "$repo" remove "$task" task/feat main
+check "remove: a link where git tracks a folder is refused before anything is removed" \
+  eval '[ "$rc" -eq 3 ] && [ -L "$task/src" ] && [ "$(cat "$tmp/linkdir/copy/a.txt")" = one ] && branch_exists "$repo" task/feat'
+rm -f "$task/src" || abort "remove link over src"
+
+# Tracked symbolic links, such as CLAUDE.md -> AGENTS.md: git made them and deletes them
+# without following them, and unlinking one would leave the folder dirty.
+new_repo tracklink
+git -C "$repo" config core.symlinks true || abort "core.symlinks"
+{ mkdir -p "$repo/docs" "$tmp/tracklink/outside" && echo agents > "$repo/AGENTS.md" && echo doc > "$repo/docs/d.txt" &&
+  echo keep > "$tmp/tracklink/outside/sentinel.txt"; } || abort "tracklink files"
+if (cd "$repo" && make_symlink AGENTS.md CLAUDE.md && make_symlink docs docs-link); then
+  { git -C "$repo" add AGENTS.md CLAUDE.md docs docs-link && git -C "$repo" commit -q -m "tracked links"; } \
+    || abort "tracklink commit"
+  run_in "$repo" create feat
+  task="$tmp/tracklink/app-feat"
+  { [ -L "$task/CLAUDE.md" ] && [ -L "$task/docs-link" ]; } || abort "the task folder has no checked-out links"
+  { commit_file "$task" feat.txt feat "task work" && mkdir -p "$task/node_modules" &&
+    make_link "$task/node_modules/ext" "$tmp/tracklink/outside"; } || abort "tracklink task"
+  run_in "$repo" merge task/feat main
+  [ "$rc" -eq 0 ] || abort "tracklink merge"
+  run_in "$repo" remove "$task" task/feat main
+  check "remove: tracked symbolic links do not block the cleanup, and every target survives" \
+    eval '[ "$rc" -eq 0 ] && [ ! -e "$task" ] && ! branch_exists "$repo" task/feat && [ "$(cat "$repo/AGENTS.md")" = agents ] && [ "$(cat "$repo/docs/d.txt")" = doc ] && [ "$(cat "$tmp/tracklink/outside/sentinel.txt")" = keep ]'
+  check "remove: only the untracked link is unlinked" [ "$(val UNLINKED)" = 1 ]
+
+  run_in "$repo" create swap
+  task="$tmp/tracklink/app-swap"
+  commit_file "$task" swap.txt swap "swap work" || abort "swap commit"
+  run_in "$repo" merge task/swap main
+  [ "$rc" -eq 0 ] || abort "swap merge"
+  { rm -f "$task/docs-link" && make_link "$task/docs-link" "$tmp/tracklink/outside"; } || abort "swap the tracked link"
+  run_in "$repo" remove "$task" task/swap main
+  check "remove: a link swapped in for a tracked symbolic link is refused, and its target survives" \
+    eval '[ "$rc" -eq 3 ] && [ -d "$task" ] && branch_exists "$repo" task/swap && [ "$(cat "$tmp/tracklink/outside/sentinel.txt")" = keep ]'
+  rm -f "$task/docs-link" || abort "remove the swapped link"
+
+  # assume-unchanged hides the swap from git status when the new target holds only
+  # ignored files (.env* here), so the index mark itself must stop the cleanup.
+  run_in "$repo" create masked
+  task="$tmp/tracklink/app-masked"
+  commit_file "$task" masked.txt masked "masked work" || abort "masked commit"
+  run_in "$repo" merge task/masked main
+  [ "$rc" -eq 0 ] || abort "masked merge"
+  { mkdir -p "$tmp/tracklink/ignored-only" && echo keep > "$tmp/tracklink/ignored-only/.env.sentinel" &&
+    git -C "$task" update-index --assume-unchanged docs-link && rm -f "$task/docs-link" &&
+    make_link "$task/docs-link" "$tmp/tracklink/ignored-only"; } || abort "masked swap"
+  [ -z "$(git -C "$task" status --porcelain --untracked-files=all)" ] || abort "the masked swap shows in git status"
+  run_in "$repo" remove "$task" task/masked main
+  check "remove: a tracked link marked assume-unchanged is refused, and its target survives" \
+    eval '[ "$rc" -eq 3 ] && [ -d "$task" ] && branch_exists "$repo" task/masked && [ "$(cat "$tmp/tracklink/ignored-only/.env.sentinel" 2>/dev/null)" = keep ]'
+  [ ! -d "$task" ] || { rm -f "$task/docs-link" && git -C "$task" update-index --no-assume-unchanged docs-link; } \
+    || abort "unmask"
+
+  # A case-only rename on disk: where the file system ignores case, git status stays
+  # clean, but find reports the new spelling, which must not be unlinked.
+  run_in "$repo" create spelled
+  task="$tmp/tracklink/app-spelled"
+  commit_file "$task" spelled.txt spelled "spelled work" || abort "spelled commit"
+  run_in "$repo" merge task/spelled main
+  [ "$rc" -eq 0 ] || abort "spelled merge"
+  { rm -f "$task/CLAUDE.md" && (cd "$task" && make_symlink AGENTS.md claude.md); } || abort "respell CLAUDE.md"
+  if [ -z "$(git -C "$task" status --porcelain --untracked-files=all)" ]; then
+    run_in "$repo" remove "$task" task/spelled main
+    check "remove: a tracked link spelled differently on disk is refused before anything is unlinked" \
+      eval '[ "$rc" -eq 3 ] && [ -L "$task/claude.md" ] && [ -d "$task" ] && branch_exists "$repo" task/spelled && grep -q CLAUDE.md "$tmp/stderr"'
+  else
+    pass "remove: case-only rename case skipped, this file system is case-sensitive"
+  fi
+else
+  pass "remove: tracked symbolic link cases skipped, this system cannot create symbolic links"
+fi
+
 # A populated submodule: its files are not tracked by the superproject, so they must not
 # be unlinked, and git refuses to remove such a worktree anyway.
 new_repo submodule
@@ -496,6 +694,12 @@ check "fingerprint: an edit changes the unstaged-diff hash" [ "$(printf '%s\n' "
 run_in "$task" hash src/a.txt b.txt
 check "hash: one HASH line per file, matching git hash-object" \
   eval '[ "$rc" -eq 0 ] && has_line "HASH=$(git -C "$task" hash-object src/a.txt) src/a.txt" && has_line "HASH=$(git -C "$task" hash-object b.txt) b.txt"'
+# A deleted locked test is a change to report, not a failure to read.
+run_in "$task" hash src/a.txt no-such-test.txt b.txt
+check "hash: a missing file prints HASH=missing, and the other files are still hashed" \
+  eval '[ "$rc" -eq 0 ] && has_line "HASH=missing no-such-test.txt" && has_line "HASH=$(git -C "$task" hash-object src/a.txt) src/a.txt" && has_line "HASH=$(git -C "$task" hash-object b.txt) b.txt"'
+run_in "$task" hash src
+check "hash: a path that exists but cannot be hashed still exits 5" [ "$rc" -eq 5 ]
 git -C "$task" checkout -q -- src/a.txt && commit_file "$task" fp.txt fp "second commit" || abort "fingerprint commit"
 run_in "$task" fingerprint
 fp_clean="$out"
@@ -536,6 +740,10 @@ rm -f "$task/lnk"
 # A failing step must leave no partial output that could compare as equal.
 run_with "$tmp/bin-nolsfiles" "$task" fingerprint
 check "fingerprint: a failing git step exits non-zero and prints nothing" eval '[ "$rc" -ne 0 ] && [ -z "$out" ]'
+# A helper's own status 2, 3, or 4 must not pass for one of the script's exit codes.
+run_with "$tmp/bin-sort2" "$task" fingerprint
+check "fingerprint: a helper that fails with status 2 exits 5, not as a usage error" \
+  eval '[ "$rc" -eq 5 ] && grep -q "unexpected failure" "$tmp/stderr" && [ -z "$out" ]'
 
 # An executable-bit change to an untracked file changes what git would commit.
 echo 'echo run' > "$task/run.sh" && chmod -x "$task/run.sh" || abort "untracked script"
@@ -552,8 +760,6 @@ rm -f "$task/run.sh"
 
 # The link cases below match codex-review-loop's fingerprint tests (0.2.4).
 fp4() { printf '%s\n' "$out" | sed -n 4p; }
-# make_symlink <target> <link>: a relative symbolic link; on Windows it needs Developer Mode.
-make_symlink() { MSYS=winsymlinks:nativestrict ln -s "$1" "$2" 2>/dev/null && [ -L "$2" ]; }
 fpd="$tmp/fingerprint"
 mkdir -p "$fpd/empty1" "$fpd/empty2" || abort "empty targets"
 
@@ -686,7 +892,8 @@ run_in "$task" commit "$tmp/commit-msg.txt"
 check "commit: refused when a copied local file is no longer ignored, and it is not committed" \
   eval '[ "$rc" -eq 3 ] && [ "$(sha "$task" HEAD)" = "$before" ] && ! git -C "$task" cat-file -e HEAD:.env.local 2>/dev/null'
 
-# The same for a copied file whose name contains a newline (not possible on Windows).
+# The same for a copied file whose name contains a newline. Git Bash on Windows stores
+# the newline as another character, so the case runs there too.
 new_repo nlcopy
 nl_name=".env.nl$(printf '\nx')"
 if rm -f "$repo/.env.local" && : > "$repo/$nl_name" 2>/dev/null && [ -f "$repo/$nl_name" ]; then
@@ -702,6 +909,20 @@ if rm -f "$repo/.env.local" && : > "$repo/$nl_name" 2>/dev/null && [ -f "$repo/$
 else
   pass "commit: newline-name case skipped, this system cannot create such a file"
 fi
+
+# A copied file named with glob characters must not match another tracked file.
+new_repo literal
+{ echo tracked > "$repo/.envx" && git -C "$repo" add -f .envx && git -C "$repo" commit -q -m "track .envx" &&
+  echo 'SECRET=bracket' > "$repo/.env[x]"; } || abort "literal setup"
+run_in "$repo" create feat
+task="$tmp/literal/app-feat"
+run_in "$repo" copy-local "$task"
+check "copy-local: a local file named with glob characters is checked literally and copied" \
+  eval '[ "$rc" -eq 0 ] && has_line "COPIED=.env[x]" && [ "$(cat "$task/.env[x]" 2>/dev/null)" = SECRET=bracket ]'
+echo change > "$task/change.txt" || abort "literal change"
+run_in "$task" commit "$tmp/commit-msg.txt"
+check "commit: a copied file named with glob characters is checked literally, and is not committed" \
+  eval '[ -f "$task/.env[x]" ] && [ "$rc" -eq 0 ] && git -C "$task" cat-file -e HEAD:change.txt && ! git -C "$task" cat-file -e "HEAD:.env[x]" 2>/dev/null'
 
 # --- safety of this test -------------------------------------------------------------
 # Run from inside another repository with no usable temp folder, this test must stop

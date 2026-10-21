@@ -4,6 +4,45 @@ Changes to the worktree-task plugin, newest first. Claude Code updates an instal
 copy only when the version in `plugins/worktree-task/.claude-plugin/plugin.json`
 changes. Documentation changes that need no update are listed at the end.
 
+## 0.2.0 — 2026-10-21
+
+- **Accepting rejected findings:** when the merge gate fails only because Claude
+  rejected the last round's findings with evidence, the stop lists them. Reply
+  **accept** to let the gate pass; your reply is recorded in the task file. `--auto`
+  never accepts. **continue** runs one more round when the last fixes were not
+  reviewed, or runs a failed Codex review again.
+- **Codex verdict:** taken only from the codex-loop run the task started, never from an
+  earlier run's files. A Codex review that stopped on an error is not clean. You can
+  skip it then by saying so, and your words are recorded.
+- **Cleanup:**
+  - tracked symbolic links, such as `CLAUDE.md` linked to `AGENTS.md`, no longer block
+    it on macOS, Linux, or Windows with `core.symlinks=true`. They stay for git, which
+    deletes them without following them;
+  - it lists tracked files once and unlinks in batches, instead of two processes per
+    link, which took minutes with thousands of package-manager links;
+  - a failed unlink now exits 5 before anything is removed;
+  - a tracked link marked assume-unchanged or skip-worktree is refused, because git
+    status cannot see a junction swapped in under such a mark;
+  - a tracked link spelled differently on disk, for example after a case-only rename,
+    is refused before anything is unlinked, instead of failing halfway with exit 5;
+  - its refusals say to unlink every link before you remove a folder yourself. The
+    README's new "Removing a task folder by hand" gives the commands.
+- **Merge:** a base that another task moved during the merge is now "not a
+  fast-forward" (exit 3), which the task retries, instead of exit 5. The task also
+  retries once when git reports `index.lock`.
+- **Locked tests:** `hash` prints `HASH=missing` for a deleted file instead of failing,
+  and a deleted locked test counts as a changed one.
+- **Run folders:** each run has its own folder,
+  `~/.claude/worktree-tasks/<repo>-<slug>/<run>/`. With Codex, a task stops before it
+  creates anything if a repository with the same folder name runs a task of that name.
+- **Resuming:** the task confirms it is in the right folder before it continues.
+- **Rebase:** dependencies are reinstalled when the base changed a lockfile or a
+  dependency manifest.
+- **File names:** `copy-local` and `commit` read them literally. A local `.env[x]` no
+  longer matches a tracked `.envx`, which made `copy-local` skip it and `commit` refuse.
+- **Exit codes:** any unexpected failure exits 5 with a message, never another code.
+- **Plugin:** a homepage, a repository link, and an icon.
+
 ## 0.1.0 — 2026-10-21
 
 - First version. The `/worktree-task:start` skill takes one task through these steps:
