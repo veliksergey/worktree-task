@@ -1,0 +1,36 @@
+# Runs the shell suite on the three platforms AGENTS.md names: Linux, macOS with the
+# system bash 3.2, and Windows with Git Bash. The suite needs only bash and git, and it
+# sets its own git identity, so the job needs no secrets.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # The system bash on macOS is 3.2, the oldest bash the script must support.
+          # The runner's PATH puts a newer Homebrew bash first, so /bin goes first.
+          - os: macos-latest
+            bash_dir: /bin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run tests/worktree.test.sh
+        shell: bash
+        env:
+          BASH_DIR: ${{ matrix.bash_dir }}
+        run: |
+          # Every "bash" in the job must resolve to the pinned one: the harness, the
+          # script under test, which the harness starts with a bare "bash", and the
+          # harness's own nested run.
+          if [ -n "$BASH_DIR" ]; then PATH="$BASH_DIR:$PATH"; export PATH; fi
+          command -v bash
+          bash --version | head -n 1
+          bash tests/worktree.test.sh
