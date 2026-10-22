@@ -33,4 +33,19 @@ jobs:
           if [ -n "$BASH_DIR" ]; then PATH="$BASH_DIR:$PATH"; export PATH; fi
           command -v bash
           bash --version | head -n 1
-          bash tests/worktree.test.sh
+          # A suite that stalls is stopped after 20 minutes, so the step ends and its
+          # log is kept. A job that reaches timeout-minutes is cancelled without one.
+          # Job control gives each background job its own process group to kill.
+          set -m
+          bash tests/worktree.test.sh &
+          suite=$!
+          (
+            sleep 1200
+            echo "watchdog: the suite is still running after 20 minutes; stopping it"
+            kill -TERM -- -"$suite" 2>/dev/null; sleep 5; kill -KILL -- -"$suite" 2>/dev/null
+          ) &
+          watchdog=$!
+          set +m
+          wait "$suite"; rc=$?
+          kill -- -"$watchdog" 2>/dev/null || true
+          exit "$rc"
