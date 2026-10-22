@@ -103,9 +103,10 @@ Nothing is created in this step.
 1. Run `worktree.sh create <SLUG> <BASE>`. Keep `WORKTREE`, `BRANCH` (now the task
    branch, `task/<SLUG>`), `BASE_SHA`, and `RUN_NAME`. Exit 3 because the folder or
    branch exists means another task uses that name: suggest `--name` and stop.
-2. Run `worktree.sh copy-local <WORKTREE>`. It copies the gitignored local files the
-   project needs, such as `.env.local`, listed by the repository's `.worktreeinclude`
-   or, without that file, the root `.env*` files. Keep the `COPIED` names for the
+2. Run `worktree.sh copy-local <WORKTREE>`. It copies the gitignored local files that
+   the main folder's `.worktreeinclude` lists, such as `.env.local`. Without that file
+   it copies nothing and prints `INCLUDE=none`: a copied file is readable by the
+   reviewers, so the user opts in per repository. Keep the `COPIED` names for the
    report. Never print or read their contents.
    - A `REFUSED` line names a file that was not copied, because a folder on its path
      inside the task folder is a link that could point outside. Tell the user.
@@ -158,7 +159,10 @@ Nothing is created in this step.
 7. Run the documented checks once before changing anything, as a baseline: lint,
    typecheck, test, build, whichever exist. If any fails, the failure comes from
    `BASE`. Tell the user, and ask whether to continue: a failing check blocks the merge
-   gate unless the task fixes it.
+   gate unless the task fixes it. When the failure names a missing environment
+   variable and step 3.2 copied nothing, say that a `.worktreeinclude` in the main
+   folder naming the file, for example the line `.env.local`, would copy it for the
+   next task, and that the copy is readable by the reviewers.
 
 ## 4. Write the task file
 
@@ -255,6 +259,9 @@ For round `N` from 1 to `--rounds`:
    | `(criterion N)` | Fix the code, never the criterion. |
    | `(beyond request)` | Remove the addition, or quote the user's request for it in the task file and reject the finding. |
    | `(handoff)` | Fix what the claim is about, or correct the claim if the code is right. |
+
+   From the commit on (steps 11.4 and 12.1), a valid P0-P2 finding is not fixed on the
+   spot: the fix needs a second commit, which only the user's explicit OK allows.
 
    Write the triage to `$RUN_DIR/claude-round<N>-triage.md`.
 6. Rerun the checks after any fix. Bring the task file's Decisions and Handoff sections
@@ -366,7 +373,10 @@ If the user asks for changes:
    - `HOOK_CHANGED=yes`: a hook changed the committed content, for example by
      reformatting it. Show `git diff <TREE_STAGED> <TREE_COMMITTED> --stat`. Then run the
      checks and one more round of each review stage on the branch against `BASE` (pass
-     `--base refs/heads/<BASE>` to codex-loop). Continue only if the merge gate passes again;
+     `--base refs/heads/<BASE>` to codex-loop), then the merge gate. The commit exists
+     now: a check or review that needs a code change follows the second-commit rule of
+     step 12.1, never a fix on the spot, because `worktree.sh rebase` refuses a task
+     folder with uncommitted changes. Go on to step 12 only when the gate passes;
      otherwise stop (step 14).
 
 ## 12. Rebase, merge, clean up
@@ -389,15 +399,16 @@ If the user asks for changes:
    - `OVERLAP` lines name files changed on both sides. Run the review stages again on
      the branch against `BASE`, following steps 7 and 8 (for codex-loop, pass
      `--base refs/heads/<BASE>`), then the merge gate.
-   - If a check or review after the rebase needs a code change, stop (step 14) before
-     changing anything. Name the finding, and say that the fix needs a second commit,
-     which the invocation does not cover. Only after the user explicitly approves:
+   - Second-commit rule. If a check or review after the commit needs a code change,
+     here or in step 11.4, stop (step 14) before changing anything. Name the finding,
+     and say that the fix needs a second commit, which the invocation does not cover.
+     Only after the user explicitly approves:
      1. make the fix;
      2. run the checks and the review stages until the merge gate passes;
      3. commit with `worktree.sh commit`, and handle its result exactly as in step 11.4
         (a hook refusal or `HOOK_CHANGED=yes` goes back through checks, reviews, and
         the gate);
-     4. repeat this step from 1.
+     4. continue with this step from 1.
 2. Use the `ExitWorktree` tool with `action: "keep"`. Confirm that
    `git rev-parse --show-toplevel` prints `REPO_ROOT`.
 3. Run `worktree.sh merge <BRANCH> <BASE>`.

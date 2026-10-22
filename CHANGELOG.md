@@ -4,6 +4,23 @@ Changes to the worktree-task plugin, newest first. Claude Code updates an instal
 copy only when the version in `plugins/worktree-task/.claude-plugin/plugin.json`
 changes. Documentation changes that need no update are listed at the end.
 
+## 0.3.0 — 2026-10-22
+
+- **Copying local files is opt-in.** The task folder receives gitignored files such as
+  `.env.local` only when a `.worktreeinclude` in the project root lists them. The old
+  fallback that copied every root `.env*` file is gone: a copied file is readable by
+  the reviewers, Codex included, so you decide per repository. `copy-local` prints
+  `INCLUDE=none` or `INCLUDE=.worktreeinclude` first. Projects whose checks need the
+  values add one line, for example `.env.local`; the README's "Local files the task
+  folder needs" explains the trade-off.
+- **Second commit after a hook change:** when a commit hook changed the content and the
+  review after it needs a code change, the task now stops and asks for the second
+  commit, as it already did after the rebase. Before, it fixed on the spot, and the
+  rebase then refused the uncommitted fix.
+- **Rebase:** a failed sort or comparison of the changed-file lists now exits 5 before
+  the rebase, instead of reading as "no overlap" and skipping the review of files both
+  sides changed.
+
 ## 0.2.0 — 2026-10-21
 
 - **Accepting rejected findings:** when the merge gate fails only because Claude

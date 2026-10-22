@@ -75,8 +75,9 @@ also in `marketplace.json`. Add an entry for the new version at the top of
   - a review finding that was rejected passes the merge gate only with the user's
     explicit acceptance, never under `--auto`. A Codex stage that failed is never
     clean; the gate skips it only on the user's explicit, recorded word;
-  - `copy-local` never writes through a link, and never copies a file the task folder
-    would not ignore. `commit` refuses while a copied local file is unignored or
+  - `copy-local` copies nothing unless the main folder's `.worktreeinclude` lists it,
+    never writes through a link, and never copies a file the task folder would not
+    ignore. `commit` refuses while a copied local file is unignored or
     tracked;
   - `rebase` pins the base commit and never moves other branches;
   - logs live outside the repository.

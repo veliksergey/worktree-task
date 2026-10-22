@@ -20,7 +20,7 @@ main folder (your project, on dev)            ../<repo>-<slug> (task folder, on 
 ──────────────────────────────────            ──────────────────────────────────────────────
 /worktree-task:start "<task>"
   read the request, ask open questions
-  create folder + branch from dev   ───────▶  copy .env.local, install dependencies
+  create folder + branch from dev   ───────▶  copy the files .worktreeinclude lists, install dependencies
                                               baseline checks
                                               task file: request, acceptance criteria
                                               tests first: interface → tests → must fail → lock
@@ -36,8 +36,8 @@ main folder (your project, on dev)            ../<repo>-<slug> (task folder, on 
 1. **Request.** Claude reads your task, or one item of a file with `--from`, and asks
    about anything that would change the result before it creates anything.
 2. **Folder and branch.** A git worktree at `../<repo>-<slug>` on the new branch
-   `task/<slug>`, started from your base branch. Gitignored local files such as
-   `.env.local` are copied in, and dependencies are installed.
+   `task/<slug>`, started from your base branch. Gitignored local files are copied
+   in only when a `.worktreeinclude` lists them, and dependencies are installed.
 3. **Task file.** Your words verbatim, numbered acceptance criteria, out of scope,
    decisions, and a handoff. The reviewers judge the change against it.
 4. **Tests first,** when they help (see below).
@@ -148,13 +148,22 @@ and locking them guards against both.
 
 ### Local files the task folder needs
 
-A worktree contains only tracked files. The task copies gitignored local files from the
-main folder:
+A worktree contains only tracked files, so the task folder starts without your
+gitignored local files, such as `.env.local`. Copying them is opt-in: nothing is copied
+unless a `.worktreeinclude` file in the project root lists them, one pattern per line in
+`.gitignore` syntax. Only files that match it and that git ignores are copied. This is
+the same convention Claude Code uses for its own worktrees.
 
-- With a `.worktreeinclude` file in the project root (`.gitignore` syntax), the files
-  that match it and that git ignores. This is the same convention Claude Code uses for
-  its own worktrees.
-- Without that file, the gitignored `.env*` files in the project root.
+```text
+.env.local
+```
+
+Opt in only when the project's documented checks need those values, for example a
+build that validates its environment or tests that need a database. A copied file is
+readable by everything that works in the task folder: the implementing session, the
+Claude reviewer and test author, and Codex when it reviews. Their instructions say
+never to print such contents, but the values can still reach a reviewer's transcript.
+Lint, typecheck, and most unit tests run without them.
 
 The report lists copied files by name, never their contents. A file the task folder's
 own `.gitignore` does not cover is not copied, because it would be committed. That
@@ -213,7 +222,8 @@ find "../<repo>-<slug>" -type l -exec rm -f -- {} + &&
 
 - **Nothing is pushed.** The merge is fast-forward only, into the base branch, in your
   main folder. It waits for your OK unless you pass `--auto`.
-- **One commit per task.** If a review after the rebase needs a fix, the task stops and
+- **One commit per task.** If a check or review after the commit needs a fix, for
+  example after a hook reformatted the commit or after the rebase, the task stops and
   asks before making a second commit, even with `--auto`.
 - **The commit is what was reviewed.** If a commit hook changes the content, for
   example by reformatting it, the change goes through the checks and reviews again
@@ -223,6 +233,10 @@ find "../<repo>-<slug>" -type l -exec rm -f -- {} + &&
   - overwrite your uncommitted changes;
   - overwrite a gitignored local file;
   - stash your work under `merge.autoStash`.
+- **Local files are copied only when you list them.** Without a `.worktreeinclude`,
+  no gitignored file leaves your main folder, so no secret reaches a reviewer. A
+  copied file is never committed: the commit step refuses if it has stopped being
+  ignored.
 - **Read-only reviewers.** The Claude reviewer has no edit tools, and a fingerprint of
   the folder before and after each review proves it changed nothing. codex-review-loop
   runs Codex in a read-only sandbox.

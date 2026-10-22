@@ -68,6 +68,8 @@ has_branch() { git -C "$top" show-ref --verify --quiet "refs/heads/$1"; }
 # Branch arguments are always resolved as refs/heads/<name>: a tag with the same name
 # would otherwise win.
 tip() { git -C "$top" rev-parse --verify "refs/heads/$1^{commit}"; }
+# Prints $1 as lines, or nothing when it is empty: printf alone would print one empty line.
+lines() { [ -z "$1" ] || printf '%s\n' "$1"; }
 # True only when git can read the folder and it has no changes or untracked files.
 is_clean() {
   local st
@@ -130,9 +132,10 @@ cmd_create() {
     "$path" "$branch" "$base" "$base_sha" "$repo-$slug"
 }
 
-# Copies gitignored local files (for example .env.local) from the main folder. Only
-# files that match .worktreeinclude, or without it the root .env* files, and that git
-# ignores are copied, so tracked files are never duplicated.
+# Copies gitignored local files, such as .env.local, from the main folder: only the
+# files that .worktreeinclude in the main folder names and that git ignores, so a
+# tracked file is never duplicated. Without .worktreeinclude nothing is copied: a copy
+# is readable by the reviewers, so the user lists what a task needs.
 cmd_copy_local() {
   [ $# -eq 1 ] || usage
   require_main
@@ -141,16 +144,15 @@ cmd_copy_local() {
   # Remembered per task folder, so that commit can refuse if a copied file stops being ignored.
   copied_list="$(git -C "$task_top" rev-parse --path-format=absolute --git-path worktree-task-copied)" \
     || die 5 "cannot locate the task folder's git directory; nothing copied"
+  if [ ! -f "$top/.worktreeinclude" ]; then
+    printf 'INCLUDE=none\nCOPIED_COUNT=0\n'
+    return 0
+  fi
+  printf 'INCLUDE=.worktreeinclude\n'
   # The list is complete before anything is copied, so a failed listing copies nothing.
   new_scratch
-  if [ -f "$top/.worktreeinclude" ]; then
-    git -C "$top" ls-files -z --others --ignored --exclude-from="$top/.worktreeinclude" > "$scratch" \
-      || die 5 "could not list the files .worktreeinclude names; nothing copied"
-  else
-    for rel in "$top"/.env*; do
-      if [ -f "$rel" ]; then printf '%s\0' "${rel#"$top"/}"; fi
-    done > "$scratch"
-  fi
+  git -C "$top" ls-files -z --others --ignored --exclude-from="$top/.worktreeinclude" > "$scratch" \
+    || die 5 "could not list the files .worktreeinclude names; nothing copied"
   while IFS= read -r -d '' rel; do
     # Read as a pattern, a name such as .env[x] would match a tracked .envx. With
     # --no-index, check-ignore takes the name as it is; ls-files says if git tracks it.
@@ -215,9 +217,14 @@ cmd_rebase() {
     || die 5 "could not list the files changed on $base; nothing changed"
   task_files="$(git -C "$here" diff --no-renames --name-only "$mb" HEAD)" \
     || die 5 "could not list the files changed on the task branch; nothing changed"
-  overlap="$(LC_ALL=C comm -12 \
-    <(printf '%s\n' "$base_files" | LC_ALL=C sort) \
-    <(printf '%s\n' "$task_files" | LC_ALL=C sort) | grep -v '^$' || true)"
+  # Sorting and comparing are checked one by one: a process substitution's failure is
+  # lost, and a lost failure would look like "no overlap" too.
+  base_files="$(lines "$base_files" | LC_ALL=C sort)" \
+    || die 5 "could not sort the files changed on $base; nothing changed"
+  task_files="$(lines "$task_files" | LC_ALL=C sort)" \
+    || die 5 "could not sort the files changed on the task branch; nothing changed"
+  overlap="$(LC_ALL=C comm -12 <(lines "$base_files") <(lines "$task_files"))" \
+    || die 5 "could not compare the two file lists; nothing changed"
   before="$(git -C "$here" rev-parse HEAD)"
   # rebase.updateRefs would also move other branches that point at the task's commits.
   if ! GIT_EDITOR=true git -C "$here" -c rebase.updateRefs=false rebase --quiet "$base_sha" >&2; then

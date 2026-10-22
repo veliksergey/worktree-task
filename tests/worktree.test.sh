@@ -116,6 +116,9 @@ exec "$real_git" "\$@"
 EOF
 chmod +x "$tmp/bin-baserace/git" || abort "chmod base race stand-in"
 printf '#!/bin/sh\nexit 2\n' > "$tmp/bin-sort2/sort" && chmod +x "$tmp/bin-sort2/sort" || abort "sort stand-in"
+# A comm that fails, for the overlap check.
+mkdir -p "$tmp/bin-nocomm" || abort "stand-in folder"
+printf '#!/bin/sh\nexit 2\n' > "$tmp/bin-nocomm/comm" && chmod +x "$tmp/bin-nocomm/comm" || abort "comm stand-in"
 
 # manual_block <file> <marker>: the first ```bash block after the line holding <marker>,
 # unindented: the manual removal commands the README and the skill give the user.
@@ -239,12 +242,17 @@ check "create: detached HEAD without a base refused" eval '[ "$rc" -eq 3 ] && [ 
 git -C "$repo" switch -q main || abort "back to main"
 
 # --- copy-local ----------------------------------------------------------------------
+# Copying is opt-in: without .worktreeinclude in the main folder, nothing is copied.
 new_repo copy
 run_in "$repo" create feat
 task="$tmp/copy/app-feat"
 run_in "$repo" copy-local "$task"
-check "copy-local: copies the gitignored root .env file" \
-  eval '[ "$rc" -eq 0 ] && has_line COPIED=.env.local && [ "$(cat "$task/.env.local")" = SECRET=do-not-print ]'
+check "copy-local: without .worktreeinclude nothing is copied, not even a root .env file" \
+  eval '[ "$rc" -eq 0 ] && [ "$(val INCLUDE)" = none ] && [ "$(val COPIED_COUNT)" = 0 ] && ! printf "%s" "$out" | grep -q ^COPIED= && [ ! -e "$task/.env.local" ]'
+printf '.env*\n' > "$repo/.worktreeinclude" || abort "worktreeinclude"
+run_in "$repo" copy-local "$task"
+check "copy-local: copies the gitignored root .env file that .worktreeinclude lists" \
+  eval '[ "$rc" -eq 0 ] && [ "$(val INCLUDE)" = .worktreeinclude ] && has_line COPIED=.env.local && [ "$(cat "$task/.env.local")" = SECRET=do-not-print ]'
 check "copy-local: skips the tracked .env.template and counts one file" \
   eval '! has_line COPIED=.env.template && [ "$(val COPIED_COUNT)" = 1 ]'
 check "copy-local: never prints file contents" eval '! printf "%s" "$out" | grep -q do-not-print'
@@ -258,6 +266,7 @@ check "copy-local: a folder outside git refused" [ "$rc" -eq 3 ]
 
 # An unexpected failure under set -e (here cp) exits 5, not the failing command's code.
 new_repo copyfail
+printf '.env.local\n' > "$repo/.worktreeinclude" || abort "worktreeinclude"
 run_in "$repo" create feat
 run_with "$tmp/bin-nocp" "$repo" copy-local "$tmp/copyfail/app-feat"
 check "copy-local: an unexpected failure exits 5 with a message" \
@@ -265,6 +274,7 @@ check "copy-local: an unexpected failure exits 5 with a message" \
 
 # A base whose .gitignore does not cover the local file: copying it would expose it.
 new_repo notignored
+printf '.env.local\n' > "$repo/.worktreeinclude" || abort "worktreeinclude"
 { git -C "$repo" switch -q -c old && printf 'node_modules/\n' > "$repo/.gitignore" &&
   git -C "$repo" commit -qam "old ignore rules" && git -C "$repo" switch -q main; } || abort "old base"
 run_in "$repo" create feat old
@@ -336,6 +346,13 @@ commit_file "$repo" listing.txt l "main moves again" || abort "listing commit"
 before="$(sha "$task" HEAD)"
 run_with "$tmp/bin-nodiff" "$task" rebase main
 check "rebase: a failed overlap listing exits 5 before rebasing" eval '[ "$rc" -eq 5 ] && [ "$(sha "$task" HEAD)" = "$before" ]'
+# A failed sort or comparison of the two lists would also read as "no overlap".
+run_with "$tmp/bin-sort2" "$task" rebase main
+check "rebase: a failed sort of the changed-file lists exits 5 before rebasing" \
+  eval '[ "$rc" -eq 5 ] && [ "$(sha "$task" HEAD)" = "$before" ] && ! printf "%s" "$out" | grep -q ^BASE_MOVED='
+run_with "$tmp/bin-nocomm" "$task" rebase main
+check "rebase: a failed comparison of the changed-file lists exits 5 before rebasing" \
+  eval '[ "$rc" -eq 5 ] && [ "$(sha "$task" HEAD)" = "$before" ] && ! printf "%s" "$out" | grep -q ^BASE_MOVED='
 
 printf 'task1\nline2\nline3\nline4\nline5\n' > "$task/b.txt" && git -C "$task" commit -qam "task edits line 1" || abort "task b.txt"
 printf 'line1\nline2\nline3\nline4\nmain5\n' > "$repo/b.txt" && git -C "$repo" commit -qam "main edits line 5" || abort "main b.txt"
@@ -884,6 +901,7 @@ run_in "$task" commit "$tmp/commit-msg.txt"
 check "commit: a failing hook is refused and nothing is committed" eval '[ "$rc" -eq 3 ] && [ "$(sha "$task" HEAD)" = "$before" ]'
 rm -f "$hook"
 
+printf '.env.local\n' > "$repo/.worktreeinclude" || abort "worktreeinclude"
 run_in "$repo" copy-local "$task"
 has_line COPIED=.env.local || abort "copy .env.local into the commit task"
 grep -v '^\.env\*$' "$task/.gitignore" > "$task/.gitignore.new" && mv "$task/.gitignore.new" "$task/.gitignore" || abort "expose .env.local"
@@ -898,6 +916,7 @@ new_repo nlcopy
 nl_name=".env.nl$(printf '\nx')"
 if rm -f "$repo/.env.local" && : > "$repo/$nl_name" 2>/dev/null && [ -f "$repo/$nl_name" ]; then
   echo 'SECRET=nl' > "$repo/$nl_name"
+  printf '.env*\n' > "$repo/.worktreeinclude" || abort "worktreeinclude"
   run_in "$repo" create feat
   task="$tmp/nlcopy/app-feat"
   run_in "$repo" copy-local "$task"
@@ -913,7 +932,7 @@ fi
 # A copied file named with glob characters must not match another tracked file.
 new_repo literal
 { echo tracked > "$repo/.envx" && git -C "$repo" add -f .envx && git -C "$repo" commit -q -m "track .envx" &&
-  echo 'SECRET=bracket' > "$repo/.env[x]"; } || abort "literal setup"
+  echo 'SECRET=bracket' > "$repo/.env[x]" && printf '.env*\n' > "$repo/.worktreeinclude"; } || abort "literal setup"
 run_in "$repo" create feat
 task="$tmp/literal/app-feat"
 run_in "$repo" copy-local "$task"
