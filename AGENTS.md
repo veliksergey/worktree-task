@@ -16,6 +16,7 @@ the user's OK commits it and fast-forwards the base branch. Users install it wit
 | `plugins/worktree-task/skills/start/` | The `start` skill, its task and report templates, and `worktree.sh`, which performs every git step. |
 | `plugins/worktree-task/agents/` | The `reviewer` (read-only) and `test-author` agents. |
 | `tests/` | Shell tests. Not shipped with the plugin. |
+| `.github/workflows/tests.yml` | GitHub Actions workflow that runs the shell tests on Linux, macOS, and Windows. |
 | `docs/reviews/decisions.md` | Rejected review findings and their evidence. |
 
 ## Commands
@@ -28,6 +29,7 @@ There is no build or lint. These are the checks:
 | Plugin manifest, skill, agents | `claude plugin validate --strict plugins/worktree-task` | Exit 0 |
 | Plugin loads | `claude --plugin-dir ./plugins/worktree-task plugin details worktree-task` | Lists the `start` skill and the `reviewer` and `test-author` agents |
 | Git steps | `bash tests/worktree.test.sh` | Exit 0, prints `all passed` |
+| Git steps on every platform | The `shell-suite` job in `.github/workflows/tests.yml`, run by GitHub Actions on each push and pull request | Passes on `ubuntu-latest`, on `macos-latest` under `/bin/bash` 3.2, and on `windows-latest` under Git Bash. A suite that stalls is stopped after 20 minutes so its log is kept. |
 
 ## Release rule
 

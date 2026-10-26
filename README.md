@@ -268,8 +268,10 @@ checkpoint. If Claude then still stops to ask, add this line to `~/.claude/CLAUD
   cleanup. The task folder is then kept, and the report says how to remove it.
 - Each task installs its own dependencies. With pnpm this is fast, because packages are
   linked from its shared store.
-- Tested on Windows 11 with Git for Windows. The script avoids platform-specific
-  commands, but macOS and Linux have not been run yet.
+- Developed on Windows 11 with Git for Windows. The git steps are tested in GitHub
+  Actions on every push: on Ubuntu, on macOS under its built-in bash 3.2, and on
+  Windows under Git for Windows. A whole task, with the Claude session and the
+  reviewers, has so far been run only on Windows.
 
 ## License
 

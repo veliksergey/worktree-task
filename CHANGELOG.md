@@ -119,3 +119,10 @@ changes. Documentation changes that need no update are listed at the end.
 - **Review gate:** it applies again after every post-rebase or hook change. A second
   commit always needs your explicit OK.
 - **Folder move:** the task stops if the session cannot move into the task folder.
+
+## Documentation only
+
+- 2026-10-26: the README no longer says macOS and Linux are untested. The shell tests
+  now run in GitHub Actions on every push, on Ubuntu, on macOS under its built-in
+  bash 3.2, and on Windows under Git Bash, and all three pass. AGENTS.md lists the
+  workflow among the checks. Nothing under `plugins/` changed.
