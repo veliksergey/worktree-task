@@ -116,9 +116,11 @@ exec "$real_git" "\$@"
 EOF
 chmod +x "$tmp/bin-baserace/git" || abort "chmod base race stand-in"
 printf '#!/bin/sh\nexit 2\n' > "$tmp/bin-sort2/sort" && chmod +x "$tmp/bin-sort2/sort" || abort "sort stand-in"
-# A comm that fails, for the overlap check.
-mkdir -p "$tmp/bin-nocomm" || abort "stand-in folder"
+# A comm that fails, for the overlap check, and a mktemp that fails, for this file's
+# own safety case.
+mkdir -p "$tmp/bin-nocomm" "$tmp/bin-nomktemp" || abort "stand-in folders"
 printf '#!/bin/sh\nexit 2\n' > "$tmp/bin-nocomm/comm" && chmod +x "$tmp/bin-nocomm/comm" || abort "comm stand-in"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/bin-nomktemp/mktemp" && chmod +x "$tmp/bin-nomktemp/mktemp" || abort "mktemp stand-in"
 
 # manual_block <file> <marker>: the first ```bash block after the line holding <marker>,
 # unindented: the manual removal commands the README and the skill give the user.
@@ -944,16 +946,24 @@ check "commit: a copied file named with glob characters is checked literally, an
   eval '[ -f "$task/.env[x]" ] && [ "$rc" -eq 0 ] && git -C "$task" cat-file -e HEAD:change.txt && ! git -C "$task" cat-file -e "HEAD:.env[x]" 2>/dev/null'
 
 # --- safety of this test -------------------------------------------------------------
-# Run from inside another repository with no usable temp folder, this test must stop
-# before writing anything.
-victim="$tmp/victim"
-mkdir -p "$victim" || abort "mkdir victim"
-( cd "$victim" && git init -q . && echo original > keep.txt && git add keep.txt && git commit -q -m victim ) || abort "victim repository"
-head_before="$(sha "$victim" HEAD)"
-( cd "$victim" && TMPDIR="$tmp/missing" bash "$here/worktree.test.sh" ) > /dev/null 2>&1
-rc=$?
-check "no temp folder: stops without touching the current repository" \
-  eval '[ "$rc" -ne 0 ] && [ "$(sha "$victim" HEAD)" = "$head_before" ] && [ -z "$(git -C "$victim" status --porcelain)" ] && [ -z "$(git -C "$victim" branch --list "task/*")" ]'
+# Run from inside another repository when no temp folder can be created, this test must
+# stop before writing anything. A failing mktemp stand-in simulates that. A TMPDIR
+# naming a missing folder did not: on macOS, mktemp -d still succeeded, the nested run
+# ran the whole suite, and its own nested run did the same, without end (observed in
+# CI). The nested run is marked, so a harness that does get a temp folder never nests
+# a second time; it then passes, and the check below sees exit 0 and fails.
+if [ -n "${WORKTREE_TEST_NESTED:-}" ]; then
+  pass "no temp folder: safety case skipped inside a nested run"
+else
+  victim="$tmp/victim"
+  mkdir -p "$victim" || abort "mkdir victim"
+  ( cd "$victim" && git init -q . && echo original > keep.txt && git add keep.txt && git commit -q -m victim ) || abort "victim repository"
+  head_before="$(sha "$victim" HEAD)"
+  ( cd "$victim" && WORKTREE_TEST_NESTED=1 PATH="$tmp/bin-nomktemp:$PATH" bash "$here/worktree.test.sh" ) > /dev/null 2>&1
+  rc=$?
+  check "no temp folder: stops without touching the current repository" \
+    eval '[ "$rc" -ne 0 ] && [ "$(sha "$victim" HEAD)" = "$head_before" ] && [ -z "$(git -C "$victim" status --porcelain)" ] && [ -z "$(git -C "$victim" branch --list "task/*")" ]'
+fi
 
 if [ "$fails" -eq 0 ]; then
   echo "all passed"
